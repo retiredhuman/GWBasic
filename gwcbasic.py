@@ -28121,10 +28121,95 @@ DQoNCg==''',
 RUNTIME_C = ["gwnum.c", "gweval.c", "gwio.c", "gwfile.c",
              "gwscreen.c", "gwsys.c", "gwstmt.c", "gwgui.c", "gwtext.c"]
 
-MSVC = (r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
-        r"\VC\Tools\MSVC\14.51.36231")
-SDK = r"C:\Program Files (x86)\Windows Kits\10"
-SDK_VER = "10.0.26100.0"
+# Default MSVC/SDK paths (used if auto-detection fails or on older systems).
+_DEFAULT_MSVC = (r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
+                 r"\VC\Tools\MSVC\14.51.36231")
+_DEFAULT_SDK = r"C:\Program Files (x86)\Windows Kits\10"
+_DEFAULT_SDK_VER = "10.0.26100.0"
+
+
+def _find_msvc_dir():
+    """Locate the MSVC compiler directory. Returns None if not found."""
+    # Prefer vswhere.exe if installed (most reliable)
+    for vswhere_path in [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+        r"C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe",
+    ]:
+        if os.path.exists(vswhere_path):
+            try:
+                r = subprocess.run(
+                    [vswhere_path, "-latest", "-products", "*",
+                     "-property", "installationPath"],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout.strip():
+                    base = r.stdout.strip()
+                    # Look for MSVC compiler directory under this installation
+                    tools = os.path.join(base, "VC", "Tools", "MSVC")
+                    if os.path.isdir(tools):
+                        # Pick the newest version directory
+                        versions = sorted(
+                            [d for d in os.listdir(tools)
+                             if os.path.isdir(os.path.join(tools, d))])
+                        if versions:
+                            return os.path.join(tools, versions[-1])
+            except Exception:
+                pass
+
+    # Fallback: scan common installation paths
+    for base in [
+        r"C:\Program Files (x86)\Microsoft Visual Studio",
+        r"C:\Program Files\Microsoft Visual Studio",
+    ]:
+        if not os.path.isdir(base):
+            continue
+        for edition in os.listdir(base):
+            tools = os.path.join(base, edition, "BuildTools", "VC", "Tools", "MSVC")
+            if not os.path.isdir(tools):
+                tools = os.path.join(base, edition, "Community", "VC", "Tools", "MSVC")
+            if not os.path.isdir(tools):
+                tools = os.path.join(base, edition, "Professional", "VC", "Tools", "MSVC")
+            if not os.path.isdir(tools):
+                tools = os.path.join(base, edition, "Enterprise", "VC", "Tools", "MSVC")
+            if not os.path.isdir(tools):
+                continue
+            versions = sorted(
+                [d for d in os.listdir(tools)
+                 if os.path.isdir(os.path.join(tools, d))])
+            if versions:
+                return os.path.join(tools, versions[-1])
+    return None
+
+
+def _find_sdk_dir():
+    """Locate the Windows SDK directory and version. Returns (dir, ver) or None."""
+    for base in [
+        r"C:\Program Files (x86)\Windows Kits\10",
+        r"C:\Program Files\Windows Kits\10",
+    ]:
+        if not os.path.isdir(base):
+            continue
+        include = os.path.join(base, "Include")
+        if not os.path.isdir(include):
+            continue
+        versions = sorted(
+            [d for d in os.listdir(include)
+             if os.path.isdir(os.path.join(include, d))])
+        if versions:
+            return base, versions[-1]
+    return None
+
+
+# Auto-detect MSVC and SDK, fall back to defaults
+_detected_msvc = _find_msvc_dir()
+MSVC = _detected_msvc or _DEFAULT_MSVC
+if _detected_msvc:
+    print(f"gwcbasic: detected MSVC at {_detected_msvc}")
+
+_detected_sdk = _find_sdk_dir()
+SDK = _detected_sdk[0] if _detected_sdk else _DEFAULT_SDK
+SDK_VER = _detected_sdk[1] if _detected_sdk else _DEFAULT_SDK_VER
+if _detected_sdk:
+    print(f"gwcbasic: detected SDK {_detected_sdk[1]} at {_detected_sdk[0]}")
 
 
 def cl_path():
@@ -28216,7 +28301,7 @@ def build_one(genc, workdir, bas, env, keep_c=False, c_only=False,
         "/link", "/STACK:1000000000", "/LTCG", "/SUBSYSTEM:CONSOLE",
         "user32.lib", "gdi32.lib", "winmm.lib",
     ]
-    r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, env=env)
+    r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, env=env, timeout=600)
     if r.returncode != 0:
         print("gwcbasic: COMPILE-FAIL %s" % name)
         tail = (r.stderr or r.stdout).strip()
@@ -28250,16 +28335,19 @@ def main(argv):
             with open(os.path.join(workdir, fname), "wb") as f:
                 f.write(base64.b64decode(b64))
         sys.path.insert(0, workdir)
-        import genc
-        env = build_env(workdir)
-        ok = 0
-        for bas in bas_files:
-            if build_one(genc, workdir, bas, env, keep_c=keep_c,
-                         c_only=c_only, native=native):
-                ok += 1
-        print("%d/%d %s" % (ok, len(bas_files),
-                             "generated" if c_only else "built"))
-        return 0 if ok == len(bas_files) else 1
+        try:
+            import genc
+            env = build_env(workdir)
+            ok = 0
+            for bas in bas_files:
+                if build_one(genc, workdir, bas, env, keep_c=keep_c,
+                             c_only=c_only, native=native):
+                    ok += 1
+            print("%d/%d %s" % (ok, len(bas_files),
+                                 "generated" if c_only else "built"))
+            return 0 if ok == len(bas_files) else 1
+        finally:
+            sys.path.pop(0)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
