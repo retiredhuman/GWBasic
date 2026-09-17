@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/32152952/README.md)
 # GW-BASIC for Windows — gwibasic & gwcbasic
 
 A modern GW-BASIC remake for Windows, in two single-file programs:
@@ -13,6 +12,8 @@ Both scripts can themselves be packaged with PyInstaller into **self-contained
 needed. And with `gwcbasic`, any BASIC program you write can be compiled into
 its own standalone .exe — no Python, no interpreter, no external files at
 runtime.
+
+** Comments, suggestions and ideas are welcome
 
 ---
 
