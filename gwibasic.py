@@ -22126,6 +22126,13 @@ def _prompt_readline(repl, prefix=''):
 
 def main():
     args = sys.argv[1:]
+    # --ide: replace the terminal with the integrated development
+    # environment (embedded below in this file).  It builds its own
+    # REPL wired to the IDE panes, so main() hands over and returns.
+    if '--ide' in args:
+        launch(sys.modules[__name__],
+              [a for a in args if a != '--ide'])
+        return
     # The graphics window is created lazily the moment a program executes a
     # graphics SCREEN command, so no --gui flag is needed for a graphics
     # program to show a window.  --nogui forces headless (e.g. for test
@@ -22408,6 +22415,1714 @@ def _repl_session(repl):
                 # terminate the line first so "Ready" starts on a fresh line.
                 repl.io.write("", newline=True)
             repl._emit("\nReady\n")
+
+
+# ==============================================================================
+# ---- EMBEDDED IDE SECTION (formerly gwibasic_ide.py) -------------------------
+# ==============================================================================
+import difflib
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, simpledialog
+except ImportError:          # headless box: interpreter still works
+    tk = None
+    filedialog = messagebox = simpledialog = None
+
+# ==============================================================================
+# GW-BASIC IDE  --  embedded in gwibasic.py, launched with:  python gwibasic.py --ide
+#
+# Replaces the terminal with a full integrated development environment:
+#   * File menu      -- New, Open (LOAD), Save, Save As, Exit
+#   * Run menu       -- RUN, RUN from line, CONT, STOP, CLEAR, TRACE, RENUM,
+#                       COMPILE, CRUN, TOKEN  (the old Ok-prompt commands,
+#                       now available only from the dropdowns)
+#   * Program menu   -- LIST, LIST range, DELETE lines, AUTO numbering,
+#                       Jump to line, Reload workspace
+#   * Edit menu      -- Undo/Redo/Cut/Copy/Paste/Delete line
+#   * Help menu      -- HELP index, HELP topic, About
+#   * Workspace      -- scrollable, full mouse editing of the program; ENTER
+#                       replaces the line under the cursor through the very
+#                       same internal path the terminal uses
+#                       (BasicREPL.load_line) and then moves the cursor to
+#                       the beginning of the next line, so a numbered line
+#                       is stored under its number and an unnumbered line
+#                       runs in immediate mode exactly as at the Ok prompt.
+#                       ENTER at the very start of a line (column 1) inserts
+#                       a blank line above it and leaves the cursor there
+#                       instead.  Ctrl+ENTER / Shift+ENTER always insert a
+#                       blank line for layout.
+#   * Console        -- the interpreter's screen: PRINT output, errors,
+#                       LIST/HELP text, and the INPUT/PAUSE input line.
+#
+# Everything lives in this folder; gwibasic.py is only given a --ide branch.
+# The graphics window a BASIC program opens (SCREEN 1 etc.) is created as a
+# Toplevel of the IDE's Tk root, and Screen.pump()/pump_if_due() pump the IDE
+# root when no graphics window is open (see _patch_screen), so the whole app
+# runs single-threaded on one Tcl interpreter: the interpreter's own per-line
+# event pump keeps the IDE responsive during a RUN (and Stop works even in a
+# tight non-drawing loop), and INPUT/PAUSE wait by pumping the IDE event loop
+# instead of blocking the console.
+# ==============================================================================
+
+
+# Ok-prompt command words intercepted by _repl_session.  In the IDE these are
+# dropdown-only: typing one in the workspace is refused (per the IDE design).
+_COMMAND_WORDS = {
+    'RUN', 'LOAD', 'SAVE', 'LIST', 'NEW', 'RENUM', 'DELETE', 'EDIT', 'LEDIT',
+    'TRACE', 'CONT', 'CLEAR', 'AUTO', 'TOKEN', 'COMPILE', 'CRUN', 'HELP',
+    'BYE', 'EXIT', 'QUIT',
+}
+
+# Tk keysym -> the normalized key token _read_key()/IoDevice use.
+_KEYSYM_TOKEN = {
+    'Return': 'enter', 'KP_Enter': 'enter', 'BackSpace': 'backspace',
+    'Up': 'up', 'Down': 'down', 'Left': 'left', 'Right': 'right',
+    'Home': 'home', 'End': 'end', 'Prior': 'pageup', 'Next': 'pagedown',
+    'Delete': 'delete', 'Escape': 'escape', 'Tab': 'tab',
+}
+
+# Token -> PC scan code (for ON KEY(n) traps fed from the IDE).
+_TOKEN_SCAN = {'up': 72, 'down': 80, 'left': 75, 'right': 77}
+
+_CSI_RE = re.compile(r'\033\[[0-9;?]*[A-Za-z]')
+
+MAX_CONSOLE_CHARS = 400000     # trim the console pane beyond this
+
+
+class GwIde:
+    """The integrated development environment around BasicREPL."""
+
+    def __init__(self, gw):
+        self.gw = gw                    # the gwibasic module (classes/state)
+        self.root = tk.Tk()             # the ONE real Tk root, made first
+        self.root.title("GW-BASIC IDE")
+        self.root.geometry("1725x1050+60+40")
+
+        # interpreter state
+        self._line_q = []               # lines typed at the console entry
+        self._key_q = []                # single keys typed while a key wait
+        self._wait = None               # None | 'line' | 'key'
+        self._stop_flag = False         # Stop menu while waiting for input
+        self._busy = False              # a command/RUN is executing
+        self._running = False           # a BASIC program is executing
+        self._pending_close = False
+        self._closing = False
+        self._syncing = False
+        self._refreshing = False
+        self._ws_pending = 0            # workspace line whose ENTER was
+                                        # deferred while a command ran (0=none)
+        self._ws_lines = []             # last committed workspace snapshot
+        self._undo_stack = []           # workspace undo: (text, cursor)
+        self._redo_stack = []           #   snapshots, one per edit session
+        self._ws_session = False        # True while typing one edit session
+        self._ws_session_timer = None   # after() id closing the session
+        self._saved_lines = {}          # last saved state of the program:
+                                        # {line num: text} — baseline for the
+                                        # "Unsaved changes" counter
+
+        self._build_ui()
+        self._patch_screen()            # graphics window -> Toplevel of root
+
+        # The REPL, wired to the IDE panes.  output_func receives every byte
+        # the interpreter would have written to the console; input_func is
+        # what io.read_line() falls back to (the console entry); the key
+        # reader is swapped on the IoDevice right after construction.
+        self.repl = gw.BasicREPL(output_func=self._output,
+                                 input_func=self._input, gui=True)
+        self.repl.io._console_read_key = self._read_key
+
+        self._banner()
+        self._update_title()
+        self._status("Ready")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.ws.focus_set()
+
+    # ------------------------------------------------------------------ #
+    #  Screen integration: graphics window as a child of the IDE root
+    # ------------------------------------------------------------------ #
+    def _patch_screen(self):
+        """Patches to gwibasic.Screen so it lives inside the IDE:
+
+        1. tk.Tk (used by Screen._init_gui) builds the graphics window as a
+           Toplevel of the IDE root instead of a second Tk interpreter.
+           One Tcl interpreter, one thread: Tk's update() drains events for
+           the whole interpreter, so the interpreter's own pump()/
+           pump_events() calls keep the WHOLE app (menus, workspace,
+           console) responsive during a RUN, and the graphics window is a
+           normal child window of the IDE.
+        2. pump() / pump_if_due() -- the interpreter's cooperative event
+           hooks -- pump the IDE root when no graphics window is open.
+           Without this a pure-text RUN (no window) never pumps Tk, so the
+           IDE would freeze and the Stop menu could never fire.
+        """
+        ide = self
+        gw = self.gw
+        real_tk = tk.Tk
+
+        class _GfxWindow(tk.Toplevel):
+            def __init__(self, master):
+                tk.Toplevel.__init__(self, master)
+                self.configure(bg="black")
+
+        def _fake_tk(*a, **k):
+            return _GfxWindow(ide.root)
+
+        tk.Tk = _fake_tk
+        self._real_tk = real_tk
+
+        orig_pump = gw.Screen.pump
+        orig_pump_if_due = gw.Screen.pump_if_due
+
+        def pump(self):
+            if self.virtual or self._root is None:
+                # No graphics window: keep the IDE alive instead.
+                if self._interrupt:
+                    self._interrupt = False
+                    raise KeyboardInterrupt
+                try:
+                    ide.root.update()
+                except tk.TclError:
+                    return False
+                return True
+            return orig_pump(self)
+
+        def pump_if_due(self, interval=0.02):
+            if self._root is None or self.virtual:
+                now = time.time()
+                if now - self._last_pump_t < interval:
+                    return
+                self._last_pump_t = now
+                try:
+                    ide.root.update()
+                except tk.TclError:
+                    pass
+                return
+            return orig_pump_if_due(self, interval)
+
+        gw.Screen.pump = pump
+        gw.Screen.pump_if_due = pump_if_due
+
+    # ------------------------------------------------------------------ #
+    #  UI construction
+    # ------------------------------------------------------------------ #
+    def _build_ui(self):
+        self._build_menus()
+        self._build_toolbar()
+
+        body = tk.PanedWindow(self.root, orient='horizontal', sashwidth=6,
+                              bd=0)
+        body.pack(fill='both', expand=True)
+        self._body = body
+        # Start with the workspace at 70% of the window width (one-shot;
+        # the user can still drag the sash afterwards).
+        def _set_sash(event):
+            body.sash_place(0, int(event.width * 0.50), 0)
+            body.unbind('<Configure>')
+        body.bind('<Configure>', _set_sash)
+
+        # -- workspace (left) ------------------------------------------ #
+        wframe = tk.Frame(body, bd=1, relief='solid')
+        body.add(wframe, minsize=320)
+        tk.Label(wframe, text=" Workspace — GWBasic"
+                             , anchor='w',
+                 font=("Segoe UI", 9)).pack(fill='x')
+        wbar = tk.Frame(wframe)
+        wbar.pack(fill='both', expand=True)
+        self.ws = tk.Text(wbar, wrap='none', undo=False,
+                          font=("Consolas", 11), padx=8, pady=6,
+                          insertwidth=2, relief='flat',
+                          background="#ffffff", foreground="#101010",
+                          selectbackground="#cfe4ff", selectforeground="#000000")
+        ysb = tk.Scrollbar(wbar, orient='vertical', command=self.ws.yview)
+        xsb = tk.Scrollbar(wbar, orient='horizontal', command=self.ws.xview)
+        self.ws.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        ysb.pack(side='right', fill='y')
+        xsb.pack(side='bottom', fill='x')
+        self.ws.pack(side='left', fill='both', expand=True)
+        self.ws.bind('<Return>', self._on_ws_return)
+        self.ws.bind('<KP_Enter>', self._on_ws_return)
+        self.ws.bind('<Button-1>', self._on_ws_click)
+        self.ws.bind('<Control-Return>', self._ws_insert_line)
+        self.ws.bind('<Shift-Return>', self._ws_insert_line)
+        self.ws.bind('<Control-KP_Enter>', self._ws_insert_line)
+        self.ws.bind('<Shift-KP_Enter>', self._ws_insert_line)
+        self.ws.bind('<Escape>', lambda e: self._request_stop()
+                     if self._running else None)
+        self.ws.bind('<Key>', self._on_ws_key)
+        self.ws.bind('<KeyRelease>', self._update_cursor_status)
+        # Undo/redo are snapshot-based (see _ws_undo).  Bound after <Key>:
+        # while a program runs _on_ws_key breaks first (Ctrl+Z feeds the key
+        # queue); while editing it passes through and these handlers fire.
+        self.ws.bind('<Control-z>', self._ws_undo)
+        self.ws.bind('<Control-Z>', self._ws_undo)
+        self.ws.bind('<Control-y>', self._ws_redo)
+        self.ws.bind('<Control-Y>', self._ws_redo)
+        # Custom paste (widget binding runs before Tk's class binding;
+        # returning 'break' replaces it).  Covers Ctrl+V and the Edit menu.
+        self.ws.bind('<<Paste>>', self._ws_paste)
+        # Custom cut: whole-line cuts take the line break with them.
+        # Covers Ctrl+X and the Edit menu.  NOTE: Tk's Text class binds
+        # Ctrl+X / Shift+Delete straight to its raw cut procedure WITHOUT
+        # routing through <<CutSelected>>, so the real key sequences must
+        # be bound explicitly; the virtual-event binding covers menu and
+        # programmatic cuts.
+        self.ws.bind('<<CutSelected>>', self._ws_cut)
+        self.ws.bind('<Control-x>', self._ws_cut)
+        self.ws.bind('<Control-X>', self._ws_cut)
+        self.ws.bind('<Shift-Delete>', self._ws_cut)
+
+        # -- console (right) ------------------------------------------- #
+        cframe = tk.Frame(body, bd=1, relief='solid')
+        body.add(cframe, minsize=320)
+        tk.Label(cframe, text=" Console — interpreter screen",
+                 anchor='w', font=("Segoe UI", 9)).pack(fill='x')
+        cbar = tk.Frame(cframe)
+        cbar.pack(fill='both', expand=True)
+        self.console = tk.Text(cbar, wrap='word', state='disabled',
+                               font=("Consolas", 11), padx=8, pady=6,
+                               relief='flat', background="#14161a",
+                               foreground="#d6d6d6", insertwidth=0,
+                               highlightthickness=0)
+        csb = tk.Scrollbar(cbar, orient='vertical', command=self.console.yview)
+        self.console.configure(yscrollcommand=csb.set, state='disabled')
+        csb.pack(side='right', fill='y')
+        self.console.pack(side='left', fill='both', expand=True)
+
+        inbar = tk.Frame(cframe)
+        inbar.pack(fill='x')
+        tk.Label(inbar, text="Input:", font=("Segoe UI", 9)).pack(
+            side='left', padx=(6, 2))
+        self.entry = tk.Entry(inbar, font=("Consolas", 11), state='disabled',
+                              relief='solid', bd=1)
+        self.entry.pack(side='left', fill='x', expand=True, padx=(0, 6),
+                        pady=4)
+        self.entry.insert(0, "— waiting for program input —")
+        self.entry.config(state='disabled')
+        self.entry.bind('<Return>', self._entry_return)
+        self.entry.bind('<KP_Enter>', self._entry_return)
+        self.entry.bind('<Key>', self._entry_key)
+        self.entry.bind('<Control-c>', self._entry_ctrl_c)
+
+        # -- status bar -------------------------------------------------- #
+        self.status_var = tk.StringVar(value="Ready")
+        self.unsaved_var = tk.StringVar(value="Unsaved changes: 0")
+        sbar = tk.Frame(self.root, bd=1, relief='sunken')
+        sbar.pack(fill='x', side='bottom')
+        tk.Label(sbar, textvariable=self.status_var, anchor='w',
+                 font=("Segoe UI", 9), padx=6).pack(
+            side='left', fill='x', expand=True)
+        tk.Label(sbar, textvariable=self.unsaved_var, anchor='e',
+                 font=("Segoe UI", 9), padx=6).pack(side='right')
+
+        # keyboard accelerators
+        self.root.bind('<F5>', lambda e: self._do_command('RUN'))
+        self.root.bind('<Control-s>', lambda e: self._save())
+        self.root.bind('<Control-S>', lambda e: self._save_as())
+        self.root.bind('<Control-o>', lambda e: self._open())
+        self.root.bind('<Control-n>', lambda e: self._new())
+        self.root.bind('<Control-g>', lambda e: self._jump_to_line())
+
+    def _build_toolbar(self):
+        """Row of command buttons directly under the dropdown menus."""
+        bar = tk.Frame(self.root, bd=1, relief='raised')
+        bar.pack(fill='x', side='top', pady=(4, 0))
+        buttons = [
+            ("NEW", self._new),
+            ("LOAD", self._open),
+            ("SAVE", self._save),
+            ("LIST", lambda: self._do_command('LIST')),
+            ("RUN", lambda: self._do_command('RUN')),
+            ("COMPILE", lambda: self._do_command('COMPILE')),
+            ("CRUN", lambda: self._do_command('CRUN')),
+        ]
+        for text, cmd in buttons:
+            tk.Button(bar, text=text, font=("Segoe UI", 8),
+                      command=cmd, relief='raised', bd=1,
+                      padx=10, pady=1).pack(side='left', padx=2, pady=2)
+
+    def _build_menus(self):
+        m = tk.Menu(self.root, tearoff=0)
+        self.root.config(menu=m)
+
+        fm = tk.Menu(m, tearoff=0)
+        fm.add_command(label="New", accelerator="Ctrl+N",
+                       command=self._new)
+        fm.add_command(label="Open (LOAD)…", accelerator="Ctrl+O",
+                       command=self._open)
+        fm.add_separator()
+        fm.add_command(label="Save", accelerator="Ctrl+S",
+                       command=self._save)
+        fm.add_command(label="Save As…", accelerator="Ctrl+Shift+S",
+                       command=self._save_as)
+        fm.add_separator()
+        fm.add_command(label="Exit", command=self._on_close)
+        m.add_cascade(label="File", menu=fm)
+
+        rm = tk.Menu(m, tearoff=0)
+        rm.add_command(label="Run", accelerator="F5",
+                       command=lambda: self._do_command('RUN'))
+        rm.add_command(label="Run from line…", command=self._run_from_line)
+        rm.add_command(label="Continue (CONT)",
+                       command=lambda: self._do_command('CONT'))
+        rm.add_command(label="Stop (Break)", accelerator="Esc",
+                       command=self._request_stop)
+        rm.add_separator()
+        rm.add_command(label="Clear (CLEAR)",
+                       command=lambda: self._do_command('CLEAR'))
+        rm.add_command(label="Trace On…", command=self._trace_on)
+        rm.add_command(label="Trace Off",
+                       command=lambda: self._do_command('TRACE OFF'))
+        rm.add_separator()
+        rm.add_command(label="RENUM…", command=self._renum)
+        rm.add_command(label="Compile (COMPILE)",
+                       command=lambda: self._do_command('COMPILE'))
+        rm.add_command(label="Compiled Run (CRUN)",
+                       command=lambda: self._do_command('CRUN'))
+        rm.add_command(label="Show Tokens (TOKEN)",
+                       command=lambda: self._do_command('TOKEN'))
+        m.add_cascade(label="Run", menu=rm)
+
+        pm = tk.Menu(m, tearoff=0)
+        pm.add_command(label="List (LIST)",
+                       command=lambda: self._do_command('LIST'))
+        pm.add_command(label="List range…", command=self._list_range)
+        pm.add_command(label="Delete lines…", command=self._delete_lines)
+        pm.add_separator()
+        pm.add_command(label="AUTO numbering…", command=self._auto_on)
+        pm.add_command(label="AUTO off", command=self._auto_off)
+        pm.add_separator()
+        pm.add_command(label="Jump to line…", accelerator="Ctrl+G",
+                       command=self._jump_to_line)
+        pm.add_command(label="Reload workspace from memory",
+                       command=self._reload_workspace)
+        m.add_cascade(label="Program", menu=pm)
+
+        em = tk.Menu(m, tearoff=0)
+        em.add_command(label="Undo", accelerator="Ctrl+Z",
+                       command=self._ws_undo)
+        em.add_command(label="Redo", accelerator="Ctrl+Y",
+                       command=self._ws_redo)
+        em.add_separator()
+        em.add_command(label="Cut", accelerator="Ctrl+X",
+                       command=lambda: self._edit('cut'))
+        em.add_command(label="Copy", accelerator="Ctrl+C",
+                       command=lambda: self._edit('copy'))
+        em.add_command(label="Paste", accelerator="Ctrl+V",
+                       command=lambda: self._edit('paste'))
+        em.add_command(label="Select All", accelerator="Ctrl+A",
+                       command=lambda: self._edit('all'))
+        em.add_separator()
+        em.add_command(label="Insert blank line", accelerator="Ctrl+Enter",
+                       command=self._ws_insert_line)
+        em.add_command(label="Delete current line",
+                       command=self._delete_current_line)
+        m.add_cascade(label="Edit", menu=em)
+
+        hm = tk.Menu(m, tearoff=0)
+        hm.add_command(label="Help index",
+                       command=lambda: self._do_command('HELP'))
+        hm.add_command(label="Help topic…", command=self._help_topic)
+        hm.add_separator()
+        hm.add_command(label="About", command=self._about)
+        m.add_cascade(label="Help", menu=hm)
+
+    # ------------------------------------------------------------------ #
+    #  Console pane (the interpreter's screen)
+    # ------------------------------------------------------------------ #
+    def _output(self, text):
+        """output_func: every byte the interpreter writes to the console.
+        Interprets the CLS clear sequence and strips stray VT codes."""
+        if not isinstance(text, str):
+            text = str(text)
+        if '\033[2J' in text:
+            self._console_clear()
+            text = text.replace('\033[2J', '')
+        if '\033' in text:
+            text = _CSI_RE.sub('', text)
+        if not text:
+            return
+        c = self.console
+        at_bottom = c.yview()[1] >= 0.999
+        state = c.cget('state')
+        c.config(state='normal')
+        c.insert('end', text)
+        if len(c.get('1.0', 'end')) > MAX_CONSOLE_CHARS:
+            c.delete('1.0', 'end-1c-%d.c' % (MAX_CONSOLE_CHARS // 2))
+        if at_bottom:
+            c.see('end')
+        c.config(state=state)
+
+    def _console_clear(self):
+        c = self.console
+        c.config(state='normal')
+        c.delete('1.0', 'end')
+        c.config(state='disabled')
+
+    def _console_text(self):
+        return self.console.get('1.0', 'end')
+
+    def _banner(self):
+        self.repl._emit("GW-BASIC enhanced for Windows — IDE\n")
+   #     self.repl._emit("Commands are in the menus.  Type program lines in "
+   #                     "press ENTER to store it (ENTER inserts no CR/LF).")
+   #     self.repl._emit("ENTER at the start of a line inserts a blank line "
+   #                     "above it; Ctrl+ENTER always inserts a blank line.")
+   #     self.repl._emit("Unnumbered workspace lines run immediately, like "
+   #                     "the Ok prompt.\n")
+        self.repl._emit("Ready\n")
+
+    # ------------------------------------------------------------------ #
+    #  Status / title
+    # ------------------------------------------------------------------ #
+    def _status(self, text):
+        self.status_var.set(text)
+
+    def _update_unsaved(self):
+        """Bottom-right counter: workspace lines that differ from the last
+        saved state of the program (the disk baseline).  ENTER commits a
+        line to the program but leaves it counted until a SAVE."""
+        try:
+            n = self._unsaved_count()
+        except Exception:
+            n = 0
+        self.unsaved_var.set("Unsaved changes: %d" % n)
+
+    def _resync_baseline(self):
+        """Rebuild the saved-state baseline (_saved_lines) after LOAD / NEW /
+        SAVE: from disk when a file name is known (also heals a program that
+        issued SAVE as a statement), else from the in-memory program, which
+        then equals the saved state."""
+        path = self.repl.last_file
+        if path and os.path.exists(path):
+            try:
+                self._saved_lines = dict(self.gw._iter_logical_lines(path))
+                return
+            except Exception:
+                pass
+        if not self.repl.dirty:
+            self._saved_lines = dict(self.repl.source)
+
+    def _unsaved_count(self):
+        """Numbered workspace lines that differ from the last saved state of
+        the program: additions, edits and deletions each count as one
+        unsaved change.  Unnumbered immediate-mode scratch lines are not
+        part of the program and do not count."""
+        ws = {}
+        for t in self._ws_text():
+            parts = t.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                ws[int(parts[0])] = parts[1]
+        n = 0
+        for num in set(ws) | set(self._saved_lines):
+            if ws.get(num) != self._saved_lines.get(num):
+                n += 1
+        return n
+
+    def _sync_deletions_to_memory(self):
+        """Keep memory a subset of the workspace for deletions: any line
+        number that is in the program but no longer present as a numbered
+        line in the workspace is removed from it (bare line number through
+        load_line, exactly the terminal's delete).  This makes 'what you see
+        in the workspace' match memory when a line is erased by ANY means --
+        keyboard Backspace/Delete, mouse cut, or Delete current line -- so a
+        deleted line can never sneak back into a RUN.  Additions/edits are
+        committed separately on ENTER / click-away; only deletions sync here.
+        """
+        if self._running or self._busy or self._refreshing or self._syncing:
+            return
+        ws_nums = set()
+        for t in self._ws_text():
+            parts = t.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                ws_nums.add(int(parts[0]))
+        changed = False
+        for num in list(self.repl.source.keys()):
+            if num not in ws_nums:
+                self.repl.load_line(str(num))   # bare number deletes the line
+                changed = True
+        if changed:
+            self._update_title()
+            self._update_unsaved()
+
+    def _update_title(self):
+        name = self.repl.last_file or "untitled"
+        star = " *" if self.repl.dirty else ""
+        self.root.title("GW-BASIC IDE — %s%s" % (os.path.basename(name), star))
+
+    def _update_cursor_status(self, event=None):
+        if self._running:
+            return
+        try:
+            row, col = self.ws.index('insert').split('.')
+        except Exception:
+            return
+        extra = ""
+        if self.repl.auto is not None:
+            extra = "   AUTO: next line %d (step %d)" % self.repl.auto
+        self._status("Ln %s, Col %d%s" % (row, int(col) + 1, extra))
+        # A keystroke may have erased a whole line: drop it from the program
+        # in memory too, so the workspace and memory never diverge on deletes.
+        self._sync_deletions_to_memory()
+        self._update_unsaved()
+
+    # ------------------------------------------------------------------ #
+    #  Workspace: the program editor.  ENTER commits through load_line().
+    # ------------------------------------------------------------------ #
+    def _on_ws_return(self, event=None):
+        # ENTER replaces the line under the cursor in the program; it
+        # inserts no CR/LF.  At the very start of a line (column 1),
+        # though, ENTER just inserts a blank line above the cursor and
+        # leaves the cursor at its start -- no commit.  While a program
+        # runs the workspace is the console keyboard: Enter feeds the
+        # program's key queue instead.
+        if self._running:
+            self.repl.interpreter.system.push_key('\r', token='enter')
+            return 'break'
+        try:
+            row, col = self.ws.index('insert').split('.')
+        except Exception:
+            row, col = '1', '1'
+        if int(col) == 0:
+            # Cursor at the line's start: insert a blank line above it and
+            # stay at the start of that new line.  Pure text edit -- safe
+            # even while a command is pumping events, so no deferral.
+            self._ws_before_change()
+            self.ws.insert('insert', '\n')
+            self.ws.mark_set('insert', '%s.0' % row)
+            self._update_cursor_status()
+            return 'break'
+        if self._busy:
+            # A command is executing (pumping events): defer this line's
+            # commit until the command finishes.
+            try:
+                self._ws_pending = int(row)
+            except Exception:
+                self._ws_pending = 0
+            return 'break'
+        self._commit_current_line()
+        return 'break'
+
+    def _ws_insert_line(self, event=None):
+        """Ctrl+ENTER / Shift+ENTER: insert a CR/LF for layout only.  The
+        blank line commits like any other (cursor on it, press ENTER)."""
+        if self._running:
+            return 'break'
+        self._ws_before_change()
+        self.ws.insert('insert', '\n')
+        return 'break'
+
+    def _commit_row(self, row):
+        """Commit the text of workspace line `row` (1-based) through the
+        interpreter's line-entry path: a numbered line is stored under its
+        number, an unnumbered line runs in immediate mode.  A line already
+        stored verbatim is skipped (repeated commits don't re-mark the file
+        dirty).  No cursor movement here -- callers decide that.  Returns
+        True when something was stored or run."""
+        if self._busy:
+            return False
+        lines = self._ws_text()
+        text = lines[row - 1].strip() if 0 < row <= len(lines) else ''
+        if not text:
+            return False
+        parts = text.split(None, 1)
+        if parts[0].isdigit() and len(parts) > 1 \
+                and self.repl.source.get(int(parts[0])) == parts[1]:
+            return False              # already exactly in memory
+        try:
+            self._commit_line(text)
+        except Exception as e:
+            # A failed commit must not leave the counter stale.
+            self.repl._emit("Error: %s: %s" % (type(e).__name__, e))
+        return True
+
+    def _commit_current_line(self):
+        """ENTER: replace the line under the cursor in the program.  A
+        numbered line is stored under its number (replacing any previous
+        version of that line); an unnumbered line runs in immediate mode,
+        as at the Ok prompt.  The cursor then moves to the beginning of
+        the next line; if this was the last line a blank one is created."""
+        if self._busy:
+            return
+        try:
+            row = int(self.ws.index('insert').split('.')[0])
+        except Exception:
+            return
+        lines = self._ws_text()
+        rowtext = lines[row - 1].strip() if 0 < row <= len(lines) else ''
+        committed = self._commit_row(row)
+        if not committed and not rowtext:
+            self.root.bell()          # nothing to commit on a blank line
+            return
+        try:
+            if row >= len(self._ws_text()):
+                self._ws_before_change()
+                self.ws.insert('end', '\n')   # create the next line
+            self.ws.mark_set('insert', '%d.0' % (row + 1))
+            self.ws.see('%d.0' % (row + 1))
+        except tk.TclError:
+            pass
+        self._ws_close_session()      # ENTER commits: undo session ends
+        self._update_unsaved()
+        self._update_cursor_status()
+
+    def _on_ws_click(self, event):
+        """Left-click on a DIFFERENT line commits the line the cursor was
+        just on (spreadsheet-style commit-on-change), so an edit is entered
+        into the program as soon as you move away from it -- the same commit
+        ENTER performs.  Same-line clicks, and clicks while a program runs
+        or a command is busy, are left to the normal editor behavior."""
+        if self._running or self._busy:
+            return None
+        try:
+            old_row = int(self.ws.index('insert').split('.')[0])
+            new_row = int(self.ws.index('@%d,%d' % (event.x, event.y))
+                          .split('.')[0])
+        except Exception:
+            return None
+        if old_row == new_row:
+            return None               # cursor stays on the same line
+        self._ws_close_session()      # moving away ends the undo session
+        self._commit_row(old_row)     # commit the previous line
+        self._update_unsaved()
+        try:
+            # Refresh Ln/Col once the default click handling has moved the
+            # cursor to the clicked line.
+            self.root.after_idle(self._update_cursor_status)
+        except tk.TclError:
+            pass
+        return None                   # let the click place the cursor
+
+    def _on_ws_key(self, event):
+        # While a program runs, keys typed in the workspace feed the system
+        # key queue (INKEY$, GET, ON KEY traps) instead of editing text —
+        # the workspace is the console keyboard, like the terminal.
+        if event.keysym in ('Return', 'KP_Enter'):
+            return None          # handled by _on_ws_return
+        if self._running and not self._wait:
+            if (event.state & 0x0004) and event.char in ('\x03', '\x18'):
+                self._request_stop()
+                return 'break'
+            token = _KEYSYM_TOKEN.get(event.keysym)
+            system = self.repl.interpreter.system
+            if token:
+                scan = _TOKEN_SCAN.get(token)
+                system.push_key('', token=token, scan=scan,
+                                mask=(0x80 if scan else 0))
+            elif event.char and event.char.isprintable():
+                system.push_key(event.char)
+            return 'break'
+        # Editing: track undo sessions.  The first change of a burst of
+        # typing snapshots the text BEFORE it; navigation closes the
+        # session so the next edit is a separate undo step.
+        ctrl = bool(event.state & 0x0004)
+        if event.keysym in ('BackSpace', 'Delete'):
+            # Backspace/Delete over a whole-line selection must take the
+            # line break with it (the selection stops before the newline,
+            # so Tk's raw delete would strand a blank line).
+            if self._ws_delete_whole_lines():
+                return 'break'
+            self._ws_before_change()
+        elif event.char and event.char.isprintable() and not ctrl:
+            self._ws_before_change()
+        elif event.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End',
+                              'Prior', 'Next'):
+            self._ws_close_session()
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Workspace undo/redo: whole-edit-session snapshots.
+    #
+    #  Tk's built-in undo records every primitive operation separately, so
+    #  replacing a selection and typing over it undoes in two confusing
+    #  steps (e.g. WAYNE -> MICHELE undoes to "M" before restoring WAYNE).
+    #  Instead, snapshot the full text + cursor once per edit session (a
+    #  burst of typing, closed by a pause, navigation, click, or commit);
+    #  one Ctrl+Z then reverses the whole edit at once.
+    # ------------------------------------------------------------------ #
+    _WS_SESSION_MS = 500          # typing pause that closes an edit session
+
+    def _ws_snapshot(self):
+        try:
+            return (self.ws.get('1.0', 'end-1c'), self.ws.index('insert'))
+        except tk.TclError:
+            return None
+
+    def _ws_before_change(self):
+        """Call before any workspace text change: opens an undo session by
+        pushing the pre-change snapshot (only the first change of a session
+        pushes; later changes in the same burst share one undo step)."""
+        if self._refreshing or self._syncing:
+            return
+        if not self._ws_session:
+            snap = self._ws_snapshot()
+            if snap is not None:
+                self._undo_stack.append(snap)
+                self._redo_stack.clear()
+            self._ws_session = True
+        self._ws_session_restart_timer()
+
+    def _ws_session_restart_timer(self):
+        if self._ws_session_timer is not None:
+            try:
+                self.root.after_cancel(self._ws_session_timer)
+            except Exception:
+                pass
+        try:
+            self._ws_session_timer = self.root.after(
+                self._WS_SESSION_MS, self._ws_close_session)
+        except tk.TclError:
+            self._ws_session_timer = None
+
+    def _ws_close_session(self):
+        if self._ws_session_timer is not None:
+            try:
+                self.root.after_cancel(self._ws_session_timer)
+            except Exception:
+                pass
+            self._ws_session_timer = None
+        self._ws_session = False
+
+    def _ws_set_text(self, text, cursor):
+        """Replace the whole workspace without recording an undo step."""
+        self._refreshing = True
+        try:
+            self.ws.delete('1.0', 'end')
+            if text:
+                self.ws.insert('1.0', text)
+            try:
+                self.ws.mark_set('insert', cursor)
+                self.ws.see(cursor)
+            except tk.TclError:
+                self.ws.mark_set('insert', 'end-1c')
+        finally:
+            self._refreshing = False
+        self._update_cursor_status()
+
+    def _ws_undo(self, event=None):
+        if self._running or self._busy:
+            return None
+        self._ws_close_session()
+        if not self._undo_stack:
+            self.root.bell()
+            return 'break'
+        cur = self._ws_snapshot()
+        text, cursor = self._undo_stack.pop()
+        if cur is not None and cur[0] != text:
+            self._redo_stack.append(cur)
+        self._ws_set_text(text, cursor)
+        return 'break'
+
+    def _ws_redo(self, event=None):
+        if self._running or self._busy:
+            return None
+        self._ws_close_session()
+        if not self._redo_stack:
+            self.root.bell()
+            return 'break'
+        cur = self._ws_snapshot()
+        text, cursor = self._redo_stack.pop()
+        if cur is not None and cur[0] != text:
+            self._undo_stack.append(cur)
+        self._ws_set_text(text, cursor)
+        return 'break'
+
+    def _ws_text(self):
+        return self.ws.get('1.0', 'end-1c').split('\n')
+
+    @staticmethod
+    def _line_num(text):
+        parts = text.strip().split(None, 1)
+        if parts and parts[0].isdigit():
+            return int(parts[0])
+        return None
+
+    def _sync_workspace(self):
+        """Diff the workspace against the last committed snapshot and feed
+        every changed/added line through repl.load_line() — the exact
+        function the terminal runs when a line is entered at the Ok prompt.
+        Removed numbered lines are deleted the same way (bare line number).
+        ENTER commits a single line (_commit_current_line); this full sync
+        is used by explicit edit actions such as Delete current line."""
+        if self._refreshing or self._syncing:
+            return
+        if self._busy:
+            self._ws_pending = True
+            return
+        new = self._ws_text()
+        old = self._ws_lines
+        if new == old:
+            return
+        self._syncing = True
+        try:
+            sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
+            removed, added = [], []
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag in ('delete', 'replace'):
+                    removed.extend(old[i1:i2])
+                if tag in ('insert', 'replace'):
+                    added.extend(new[j1:j2])
+            # Deletes first: an edited line number (10 -> 15) must drop the
+            # old number before the new one is stored.
+            for text in removed:
+                num = self._line_num(text)
+                if num is not None and num in self.repl.program:
+                    self.repl.load_line(str(num))
+            for text in added:
+                if text.strip():
+                    self._commit_line(text)
+        except KeyboardInterrupt:
+            # Ctrl+C (Stop) while an immediate-mode line was running.
+            self.repl._emit("Break")
+        except Exception as e:
+            self.repl._emit("Error: %s: %s" % (type(e).__name__, e))
+        finally:
+            self._ws_lines = self._ws_text()
+            self._syncing = False
+            self._update_title()
+            self._update_unsaved()
+
+    def _commit_line(self, text):
+        """Enter one workspace line into the interpreter exactly as the
+        terminal would: commands are dropdown-only, AUTO numbering applies,
+        numbered lines are stored, unnumbered lines run in immediate mode."""
+        t = text.strip()
+        if not t:
+            return
+        first = t.split(None, 1)[0]
+        if not first.isdigit() and first.upper().rstrip(':') in _COMMAND_WORDS:
+            self.repl._emit("IDE: '%s' is a command — run it from the "
+                            "Run/Program menus, not the workspace."
+                            % first.upper())
+            return
+        if self.repl.auto is not None:
+            # AUTO mode, mirroring _repl_session's AUTO branch.
+            num, inc = self.repl.auto
+            if first.isdigit() and len(t.split(None, 1)) == 1:
+                n = int(first)
+                self.repl.program[n] = []
+                self.repl.source.pop(n, None)
+                self.repl.dirty = True
+                self.repl.update_interpreter()
+                self.repl.auto = (n, inc)
+            elif first.isdigit():
+                n = int(first)
+                self.repl.auto = (n, inc)
+                self.repl.load_line(t)
+            else:
+                self.repl.load_line('%d %s' % (num, t))
+            self.repl.auto = (self.repl.auto[0] + inc, inc)
+            self._update_cursor_status()
+            return
+        self.repl.load_line(t)
+        if not first.isdigit():
+            # Immediate-mode statement: the terminal prints Ready after it.
+            self._ready()
+
+    def _refresh_workspace(self):
+        """Rebuild the workspace from the program in memory (after LOAD,
+        NEW, RENUM, DELETE, or a program that ran NEW)."""
+        lines = ["%d %s" % (n, self.repl.source.get(n, ''))
+                 for n in sorted(self.repl.source.keys())]
+        self._refreshing = True
+        try:
+            self.ws.delete('1.0', 'end')
+            if lines:
+                self.ws.insert('1.0', '\n'.join(lines))
+            # Program rebuilt from memory: the old undo history is moot.
+            self._ws_close_session()
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self.ws.see('1.0')
+        finally:
+            self._ws_lines = self._ws_text()
+            self._refreshing = False
+        self._update_title()
+        self._update_unsaved()
+
+    def _reload_workspace(self):
+        self._refresh_workspace()
+        self.repl._emit("Workspace reloaded from the program in memory.")
+
+    # ------------------------------------------------------------------ #
+    #  Command execution (the dropdowns replace the Ok-prompt commands)
+    # ------------------------------------------------------------------ #
+    def _do_command(self, cmd):
+        """Run one Ok-prompt command, mirroring _repl_session's dispatch and
+        its post-command 'Ready' handling.  Uncommitted workspace lines are
+        NOT auto-entered: ENTER stores the single line under the cursor."""
+        if self._busy:
+            self.root.bell()
+            return
+        self._busy = True
+        self._stop_flag = False
+        try:
+            self.repl._emit("> %s" % cmd)
+            show_ready = self._dispatch(cmd)
+            if show_ready:
+                self._ready()
+            self._update_title()
+        except KeyboardInterrupt:
+            self.repl._emit("Break")
+        except Exception as e:
+            self.repl._emit("Error: %s: %s" % (type(e).__name__, e))
+        finally:
+            self._busy = False
+            if not self._closing:
+                self._status("Ready")
+                self.ws.focus_set()
+            if self._ws_pending and not self._closing:
+                row = self._ws_pending
+                self._ws_pending = 0
+                lines = self._ws_text()
+                if 0 < row <= len(lines) and lines[row - 1].strip():
+                    self._commit_line(lines[row - 1].strip())
+            self._update_unsaved()
+            self._finish_pending_close()
+
+    def _dispatch(self, cmd):
+        """Returns True when the caller should print 'Ready' (numbered-line
+        stores and LEDIT do not, matching _repl_session)."""
+        repl = self.repl
+        gw = self.gw
+        line = cmd.strip()
+        upper = line.upper()
+        if upper in ('BYE', 'EXIT', 'QUIT'):
+            self._on_close()
+            return False
+        if upper == 'HELP' or upper.startswith('HELP '):
+            parts = line.split(None, 1)
+            pager = gw.MorePager(repl._emit, repl.io.read_line)
+            if len(parts) > 1 and parts[1].strip():
+                gw.show_help_topic(pager, parts[1].strip())
+            else:
+                gw.print_help(pager)
+            return True
+        if upper == 'NEW':
+            repl.new()
+            self._refresh_workspace()
+            self._resync_baseline()
+            return True
+        if upper == 'AUTO' or upper.startswith('AUTO '):
+            parts = line.split(None, 1)
+            try:
+                repl.auto_command(parts[1].strip() if len(parts) > 1 else '')
+                self._update_cursor_status()
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return True
+        if upper == 'CLEAR' or upper.startswith('CLEAR '):
+            parts = line.split(None, 1)
+            try:
+                repl.clear_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return True
+        if upper.startswith('RUN'):
+            parts = line.split(None, 1)
+            repl._emit("")
+            self._running = True
+            self._status("Running…  (Run ▸ Stop or Esc to break)")
+            try:
+                repl.run_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            except Exception as e:
+                repl._emit("Error: %s: %s" % (type(e).__name__, e))
+            finally:
+                self._running = False
+            self._after_program_run()
+            return True
+        if upper.startswith('COMPILE'):
+            parts = line.split(None, 1)
+            try:
+                repl.compile_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            except Exception as e:
+                repl._emit("Error: %s: %s" % (type(e).__name__, e))
+            return True
+        if upper.startswith('CRUN'):
+            parts = line.split(None, 1)
+            try:
+                repl.crun_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            except Exception as e:
+                repl._emit("Error: %s: %s" % (type(e).__name__, e))
+            return True
+        if upper.startswith('LIST'):
+            parts = line.split(None, 1)
+            try:
+                repl.list_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return True
+        if upper.startswith('LOAD'):
+            parts = line.split(None, 1)
+            if len(parts) > 1:
+                argstr = parts[1].strip()
+                run_after = False
+                if argstr.upper().endswith(',R'):
+                    argstr = argstr[:-2].strip()
+                    run_after = True
+                try:
+                    repl.load_command(argstr, keep_files=run_after,
+                                      run_after=run_after)
+                    self._refresh_workspace()
+                    self._resync_baseline()
+                except gw.BasicError as e:
+                    repl._emit("Error: %s" % e)
+            else:
+                repl._emit("Usage: LOAD filename[,r]")
+            return True
+        if upper.startswith('SAVE'):
+            parts = line.split(None, 1)
+            rest = parts[1].strip() if len(parts) > 1 else ''
+            try:
+                repl.save_command(rest or None)
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            except Exception as e:
+                repl._emit("Error: %s: %s" % (type(e).__name__, e))
+            self._resync_baseline()
+            self._update_title()
+            return True
+        if upper.startswith('DELETE'):
+            parts = line.split(None, 1)
+            try:
+                repl.delete_lines(parts[1].strip() if len(parts) > 1 else '')
+                self._refresh_workspace()
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return True
+        if upper.startswith('LEDIT') or upper.startswith('EDIT'):
+            # In the IDE the workspace IS the line editor: EDIT/LEDIT jump
+            # to (and select) the referenced line.
+            is_ledit = upper.startswith('LEDIT')
+            parts = line.split(None, 1)
+            argstr = parts[1].strip() if len(parts) > 1 else ''
+            try:
+                num = repl._list_line_num(argstr) if argstr else None
+                if num is None:
+                    raise gw.BasicError("Illegal function call")
+                if num not in repl.program:
+                    raise gw.BasicError("Undefined line number")
+                repl.current_line = num
+                self._jump_to_program_line(num)
+                repl._emit("%d %s" % (num, repl.source[num]))
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return not is_ledit
+        if upper.startswith('TRACE'):
+            parts = line.split(None, 1)
+            try:
+                repl.trace_command(parts[1].strip() if len(parts) > 1 else '')
+            except gw.BasicError as e:
+                repl._emit("Error: %s" % e)
+            return True
+        if upper == 'CONT':
+            self._running = True
+            self._status("Running…  (Run ▸ Stop or Esc to break)")
+            try:
+                repl.cont_command()
+            finally:
+                self._running = False
+            self._after_program_run()
+            return True
+        if upper == 'RENUM' or upper.startswith('RENUM '):
+            parts = line.split(None, 1)
+            repl.renum(parts[1] if len(parts) > 1 else '')
+            self._refresh_workspace()
+            return True
+        if upper == 'TOKEN':
+            repl.show_tokens()
+            return True
+        # Not a command: an immediate-mode statement — same path as the
+        # terminal's else branch.
+        try:
+            repl.load_line(line)
+        except gw.BasicError as e:
+            repl._emit("Error: %s" % e)
+        except Exception as e:
+            repl._emit("Error: %s: %s" % (type(e).__name__, e))
+        return True
+
+    def _after_program_run(self):
+        """A run/cont may have replaced the program (NEW inside the program);
+        resync the workspace when its numbered lines no longer match
+        memory.  Unnumbered immediate-mode scratch lines in the editor are
+        ignored, so they never force a refresh."""
+        if getattr(self.repl.interpreter, '_new_cleared', False):
+            self.repl.interpreter._new_cleared = False
+            self.repl.source.clear()
+        self._resync_baseline()
+        have = {}
+        for t in self._ws_text():
+            parts = t.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                have[int(parts[0])] = parts[1]
+        want = dict(self.repl.source)
+        if have != want:
+            self._refresh_workspace()
+
+    def _ready(self):
+        """Print 'Ready' with the same graphics-window teardown _repl_session
+        performs when a program has ended."""
+        repl = self.repl
+        try:
+            screen = repl.interpreter.screen
+            if (screen._root is not None or not screen.is_text()) \
+                    and not repl.interpreter._stopped:
+                screen.close()
+                screen.set_mode(0)
+            if screen.cursor_col != 0:
+                repl.io.write("", newline=True)
+            repl._emit("\nReady\n")
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Stop / break
+    # ------------------------------------------------------------------ #
+    def _request_stop(self):
+        """The IDE's Ctrl+C: the run loop polls screen._stop_requested every
+        line (same flag the graphics window's ESC sets); the input/key waits
+        poll _stop_flag."""
+        if not (self._running or self._wait):
+            self.root.bell()
+            return
+        try:
+            self.repl.interpreter.screen._stop_requested = True
+        except Exception:
+            pass
+        self._stop_flag = True
+        self._status("Stopping…")
+
+    # ------------------------------------------------------------------ #
+    #  Interpreter input: INPUT / PAUSE / HELP paging
+    # ------------------------------------------------------------------ #
+    def _pump(self):
+        """Keep the IDE alive while the interpreter blocks for input: drain
+        the Tk event loop (menus, workspace, graphics window) in slices."""
+        try:
+            self.root.update()
+        except tk.TclError:
+            raise KeyboardInterrupt
+        time.sleep(0.008)
+
+    def _input(self, prompt=''):
+        """input_func: io.read_line() falls back here (INPUT, LINE INPUT,
+        PAUSE on a non-tty, HELP paging).  Waits for a line in the console
+        entry while pumping the IDE."""
+        if prompt:
+            self.repl._emit(prompt, newline=False)
+        self._begin_wait('line')
+        try:
+            while not self._line_q:
+                if self._stop_flag:
+                    self._stop_flag = False
+                    raise KeyboardInterrupt
+                self._pump()
+            return self._line_q.pop(0)
+        finally:
+            self._end_wait()
+
+    def _read_key(self):
+        """console_read_key: key waits read one key from the console entry
+        while pumping the IDE."""
+        self._begin_wait('key')
+        try:
+            while not self._key_q:
+                if self._stop_flag:
+                    self._stop_flag = False
+                    raise KeyboardInterrupt
+                self._pump()
+            return self._key_q.pop(0)
+        finally:
+            self._end_wait()
+
+    def _begin_wait(self, kind):
+        self._wait = kind
+        e = self.entry
+        e.config(state='normal')
+        e.delete(0, 'end')
+        e.focus_set()
+        self._status("Waiting for %s — type in the Input box%s"
+                     % ("a line" if kind == 'line' else "a key",
+                        " (Enter submits)" if kind == 'line' else ""))
+
+    def _end_wait(self):
+        self._wait = None
+        e = self.entry
+        e.delete(0, 'end')
+        e.config(state='disabled')
+        e.insert(0, "— waiting for program input —")
+        if not self._running:
+            self._status("Ready")
+
+    def _entry_return(self, event=None):
+        if self._wait == 'key':
+            self._key_q.append('enter')
+            return 'break'
+        if self._wait == 'line':
+            line = self.entry.get()
+            self.entry.delete(0, 'end')
+            self._output(line + "\n")     # echo, like the terminal
+            self._line_q.append(line)
+            return 'break'
+        if self._running:
+            # Enter while a program runs: feed it to INKEY$/KEY traps.
+            self.repl.interpreter.system.push_key('\r', token='enter')
+            return 'break'
+        self.root.bell()
+        return 'break'
+
+    def _entry_key(self, event):
+        token = _KEYSYM_TOKEN.get(event.keysym)
+        if self._wait == 'key':
+            if token:
+                self._key_q.append(token)
+            elif event.char and event.char.isprintable():
+                self._key_q.append(event.char)
+                self._output(event.char, newline=False)
+            return 'break'
+        return None
+
+    def _entry_ctrl_c(self, event=None):
+        if self._wait == 'key':
+            self._key_q.append('ctrl_c')
+        elif self._wait == 'line' or self._running:
+            self._request_stop()
+        return 'break'
+
+    # ------------------------------------------------------------------ #
+    #  File menu actions
+    # ------------------------------------------------------------------ #
+    def _confirm_discard(self):
+        if not self.repl.dirty:
+            return True
+        return messagebox.askyesno(
+            "GW-BASIC IDE",
+            "The program has unsaved changes.\nDiscard them?",
+            parent=self.root)
+
+    def _new(self):
+        if self._busy:
+            self.root.bell()
+            return
+        if not self._confirm_discard():
+            return
+        self._do_command('NEW')
+
+    def _open(self):
+        if self._busy:
+            self.root.bell()
+            return
+        if not self._confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            title="Open BASIC program", parent=self.root,
+            initialdir=self._initial_dir(),
+            filetypes=[("BASIC programs", "*.bas *.BAS"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self.load_path(path)
+
+    def load_path(self, path):
+        self._do_command('LOAD "%s"' % path)
+
+    def _save(self):
+        if self._busy:
+            self.root.bell()
+            return
+        if self.repl.last_file:
+            self._do_command('SAVE')
+        else:
+            self._save_as()
+
+    def _save_as(self):
+        if self._busy:
+            self.root.bell()
+            return
+        init = self.repl.last_file or "program.bas"
+        path = filedialog.asksaveasfilename(
+            title="Save BASIC program", parent=self.root,
+            initialdir=self._initial_dir(),
+            initialfile=os.path.basename(init),
+            defaultextension=".bas",
+            filetypes=[("BASIC programs", "*.bas"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self._do_command('SAVE "%s"' % path)
+
+    def _initial_dir(self):
+        if self.repl.last_file:
+            return os.path.dirname(os.path.abspath(self.repl.last_file))
+        return os.getcwd()
+
+    # ------------------------------------------------------------------ #
+    #  Run / Program menu dialogs
+    # ------------------------------------------------------------------ #
+    def _run_from_line(self):
+        n = simpledialog.askstring("Run from line", "Line number:",
+                                   parent=self.root)
+        if n and n.strip().isdigit():
+            self._do_command('RUN %s' % n.strip())
+
+    def _trace_on(self):
+        rate = simpledialog.askstring(
+            "Trace", "Lines per second (1-100, blank = 3):", parent=self.root)
+        if rate is None:
+            return
+        self._do_command(('TRACE ON %s' % rate.strip())
+                         if rate.strip() else 'TRACE ON')
+
+    def _renum(self):
+        args = simpledialog.askstring(
+            "RENUM", "new,[old][,increment]  (blank = defaults):",
+            parent=self.root)
+        if args is None:
+            return
+        self._do_command(('RENUM %s' % args) if args.strip() else 'RENUM')
+
+    def _delete_lines(self):
+        args = simpledialog.askstring(
+            "Delete lines", "Line number or range (e.g. 40 or 40-90):",
+            parent=self.root)
+        if args and args.strip():
+            self._do_command('DELETE %s' % args.strip())
+
+    def _list_range(self):
+        args = simpledialog.askstring(
+            "List range", "Line number or range (blank = all):",
+            parent=self.root)
+        if args is None:
+            return
+        self._do_command(('LIST %s' % args) if args.strip() else 'LIST')
+
+    def _auto_on(self):
+        args = simpledialog.askstring(
+            "AUTO numbering", "start[,increment]  (blank = 10,10):",
+            parent=self.root)
+        if args is None:
+            return
+        self._do_command(('AUTO %s' % args) if args.strip() else 'AUTO')
+
+    def _auto_off(self):
+        if self.repl.auto is not None:
+            self.repl.auto = None
+            self.repl._emit("AUTO off")
+            self._update_cursor_status()
+
+    def _help_topic(self):
+        topic = simpledialog.askstring("Help topic",
+                                       "Topic (e.g. PRINT, FOR, SCREEN):",
+                                       parent=self.root)
+        if topic and topic.strip():
+            self._do_command('HELP %s' % topic.strip())
+
+    def _about(self):
+        messagebox.showinfo(
+            "About GW-BASIC IDE",
+            "GW-BASIC IDE\n\n"
+            "The gwibasic interpreter with an integrated development "
+            "environment:\n"
+            "  * File / Run / Program menus replace the Ok-prompt commands\n"
+            "  * The workspace edits the program; ENTER replaces the line "
+            "under the cursor through the interpreter's own line-entry "
+            "path and moves to the beginning of the next line\n"
+            "  * The console pane is the interpreter's screen and answers "
+            "INPUT/PAUSE\n",
+            parent=self.root)
+
+    # ------------------------------------------------------------------ #
+    #  Edit menu actions
+    # ------------------------------------------------------------------ #
+    def _ws_delete_whole_lines(self):
+        """If the selection covers one or more WHOLE lines, delete it
+        together with the line break (trailing newline, or the preceding
+        one for the last line) so no blank line is stranded.  Returns True
+        when the delete was handled here."""
+        sel = self.ws.tag_ranges('sel')
+        if not sel:
+            return False
+        first, last = str(sel[0]), str(sel[1])
+        if first == last:
+            return False
+        try:
+            if not (self.ws.compare(first, '==', '%s linestart' % first)
+                    and self.ws.compare(last, '==', '%s lineend' % last)):
+                return False          # partial selection: normal delete
+            self._ws_before_change()
+            if self.ws.compare(last, '<', 'end-1c'):
+                self.ws.delete(first, '%s + 1 chars' % last)
+            elif self.ws.compare(first, '>', '1.0'):
+                self.ws.delete('%s - 1 chars' % first, last)
+            else:
+                self.ws.delete(first, last)
+            self.ws.mark_set('insert', first)
+        except tk.TclError:
+            return False
+        self._ws_session_restart_timer()
+        self._update_cursor_status()
+        return True
+
+    def _ws_paste(self, event=None):
+        """Paste into the workspace keeping BASIC lines intact: pasted text
+        never merges with the text that follows the cursor.  A multi-line
+        block (or any paste landing in front of existing text) gets a CR/LF
+        after its last character, so the line being pasted in front of
+        starts on its own line instead of being appended to the paste."""
+        if self._running:
+            return None               # workspace is the console keyboard
+        try:
+            text = self.ws.clipboard_get()
+        except tk.TclError:
+            return 'break'            # clipboard empty or not text
+        if not text:
+            return 'break'
+        # Normalize line endings and drop trailing blank lines so a copied
+        # block does not inject empty lines.
+        text = text.replace('\r\n', '\n').replace('\r', '\n').rstrip('\n')
+        if not text:
+            return 'break'
+        self._ws_before_change()
+        try:
+            if self.ws.tag_ranges('sel'):
+                # Replace the selection where it is, not at the old cursor.
+                self.ws.mark_set('insert', 'sel.first')
+                self.ws.delete('sel.first', 'sel.last')
+            # A multi-line block pasted mid-line must not merge into the
+            # text before the cursor either: start it on its own line.
+            if '\n' in text:
+                head = self.ws.get('%s linestart' % self.ws.index('insert'),
+                                   'insert')
+                if head:
+                    self.ws.insert('insert', '\n')
+            self.ws.insert('insert', text)
+            # If the cursor now sits in front of text on the same line,
+            # break the line: the existing text must not join the paste.
+            nxt = self.ws.get('insert', 'insert + 1 chars')
+            if nxt and nxt != '\n':
+                self.ws.insert('insert', '\n')
+        except tk.TclError:
+            pass
+        self._ws_session_restart_timer()
+        self._update_cursor_status()
+        return 'break'
+
+    def _ws_cut(self, event=None):
+        """Cut the selection, keeping BASIC lines intact: when the
+        selection covers one or more WHOLE lines, the line break goes with
+        them so no empty line is left behind (Tk's raw cut keeps the
+        newline and strands a blank line).  Partial selections cut
+        normally."""
+        if self._running:
+            return None               # workspace is the console keyboard
+        sel = self.ws.tag_ranges('sel')
+        if not sel:
+            self.root.bell()
+            return 'break'
+        first, last = str(sel[0]), str(sel[1])
+        try:
+            text = self.ws.get(first, last)
+        except tk.TclError:
+            return 'break'
+        if not text:
+            # A zero-width selection: selecting a BLANK line gives one.
+            # Cut the blank line (with its line break) like any other.
+            if (first == last
+                    and self.ws.compare(first, '==', '%s linestart' % first)
+                    and self.ws.compare(first, '==', '%s lineend' % first)):
+                text = ''
+            else:
+                self.root.bell()
+                return 'break'
+        whole = (self.ws.compare(first, '==', '%s linestart' % first)
+                 and self.ws.compare(last, '==', '%s lineend' % last))
+        self._ws_before_change()
+        try:
+            self.ws.clipboard_clear()
+            self.ws.clipboard_append(text + '\n' if whole else text)
+            if whole:
+                if self.ws.compare(last, '<', 'end-1c'):
+                    # take the trailing newline with the line(s)
+                    self.ws.delete(first, '%s + 1 chars' % last)
+                elif self.ws.compare(first, '>', '1.0'):
+                    # last line(s): take the PRECEDING newline instead
+                    self.ws.delete('%s - 1 chars' % first, last)
+                else:
+                    self.ws.delete(first, last)
+                self.ws.mark_set('insert', first)
+            else:
+                self.ws.delete(first, last)
+        except tk.TclError:
+            pass
+        self._ws_session_restart_timer()
+        self._update_cursor_status()
+        return 'break'
+
+    def _edit(self, what):
+        self.ws.focus_set()
+        try:
+            if what == 'cut':
+                self.ws.event_generate('<<CutSelected>>')  # -> _ws_cut
+            elif what == 'copy':
+                self.ws.event_generate('<<CopySelection>>')
+            elif what == 'paste':
+                self.ws.event_generate('<<Paste>>')   # -> _ws_paste
+            elif what == 'all':
+                self.ws.tag_add('sel', '1.0', 'end')
+        except tk.TclError:
+            pass
+        # Changes commit when you position the cursor on the affected line
+        # and press ENTER (Delete current line commits immediately).
+
+    def _delete_current_line(self):
+        self.ws.focus_set()
+        try:
+            row = int(self.ws.index('insert').split('.')[0])
+            lines = self._ws_text()
+            text = lines[row - 1].strip() if 0 < row <= len(lines) else ''
+            parts = text.split(None, 1)
+            num = int(parts[0]) if parts and parts[0].isdigit() else None
+            self._ws_before_change()
+            if row >= len(lines):
+                # Last line: take the PRECEDING newline too, or a blank
+                # line is stranded at the end.
+                if row > 1:
+                    self.ws.delete('%d.0 - 1 chars' % row, 'end')
+                else:
+                    self.ws.delete('1.0', 'end')
+            else:
+                self.ws.delete('%d.0' % row, '%d.0 + 1 line' % row)
+            self._ws_close_session()
+        except tk.TclError:
+            return
+        # Remove the line from the program in memory directly (independent of
+        # any snapshot), so the workspace and memory always agree.
+        if num is not None and num in self.repl.program:
+            self.repl.load_line(str(num))
+        self._update_title()
+        self._update_unsaved()
+
+    def _jump_to_line(self):
+        text = simpledialog.askstring("Jump to line",
+                                      "Program line number:", parent=self.root)
+        if text and text.strip().isdigit():
+            self._jump_to_program_line(int(text.strip()))
+
+    def _jump_to_program_line(self, num):
+        prefix = "%d " % num
+        target = None
+        lines = self._ws_text()
+        for i, t in enumerate(lines):
+            if t.strip() == str(num) or t.startswith(prefix):
+                target = i + 1
+                break
+        if target is None:
+            self.repl._emit("(line %d is not shown in the workspace)" % num)
+            return
+        self.ws.focus_set()
+        self.ws.see('%d.0' % target)
+        self.ws.tag_remove('sel', '1.0', 'end')
+        self.ws.tag_add('sel', '%d.0' % target, '%d.end' % target)
+        self.ws.mark_set('insert', '%d.0' % target)
+
+    # ------------------------------------------------------------------ #
+    #  Close / exit
+    # ------------------------------------------------------------------ #
+    def _on_close(self):
+        if self._closing:
+            return
+        if self._busy:
+            # A command is running (pumping events): stop it and close when
+            # it unwinds, instead of destroying the root mid-run.
+            self._pending_close = True
+            self._request_stop()
+            return
+        if self.repl.dirty:
+            if not messagebox.askyesno("GW-BASIC IDE",
+                                       "Quit with unsaved changes?",
+                                       parent=self.root):
+                return
+        self._closing = True
+        try:
+            self.repl.interpreter.screen.close()
+        except Exception:
+            pass
+        try:
+            self.repl.interpreter.files.close()
+        except Exception:
+            pass
+        try:
+            self.repl.interpreter.system.music_stop()
+            self.repl.interpreter.system.stop_speaker()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _finish_pending_close(self):
+        if self._pending_close and not self._busy:
+            self._pending_close = False
+            self._on_close()
+
+    # ------------------------------------------------------------------ #
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------- #
+#  Launch
+# ---------------------------------------------------------------------- #
+def _hide_console():
+    """--ide replaces the terminal: hide the console window (if any).
+    Returns the handle so launch() can restore it on exit."""
+    if os.name != 'nt':
+        return 0
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.GetConsoleWindow()
+        if h:
+            ctypes.windll.kernel32.ShowWindow(h, 0)   # SW_HIDE
+            return h
+    except Exception:
+        pass
+    return 0
+
+
+def launch(gw, argv=()):
+    """Entry point called from gwibasic.main() when --ide is present.
+    `gw` is the gwibasic module itself, so the IDE shares its classes."""
+    # The IDE is the terminal now: make the interpreter treat the console as
+    # non-interactive so every read routes to the IDE panes.
+    try:
+        sys.stdin = gw._EOFTextIO()
+    except Exception:
+        pass
+    console = 0
+    try:
+        ide = GwIde(gw)
+        # The IDE window is up: only now hide the console it replaces (so a
+        # startup crash still shows its traceback in the visible console).
+        console = _hide_console()
+        for a in argv:
+            if a and os.path.exists(a):
+                ide.load_path(a)
+                break
+        ide.run()
+    finally:
+        if console:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.ShowWindow(console, 5)  # SW_SHOW
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
